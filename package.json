@@ -1,7 +1,7 @@
 {
     "name": "@wharfkit/actionstream",
     "description": "Client library for subscribing to Roborovski action streams",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "homepage": "https://github.com/wharfkit/actionstream",
     "license": "BSD-3-Clause",
     "main": "lib/actionstream.js",
