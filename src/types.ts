@@ -1,4 +1,4 @@
-import {Name, NameType, UInt64, UInt64Type} from '@wharfkit/antelope'
+import {Checksum256, Name, NameType, UInt64, UInt64Type} from '@wharfkit/antelope'
 
 export interface ActionStreamFilter {
     contracts?: NameType[]
@@ -21,6 +21,7 @@ export interface StreamAction {
     contract: Name
     action: Name
     receiver: Name
+    trxId: Checksum256
     hexData?: string
     data?: Record<string, unknown>
 }
@@ -60,6 +61,7 @@ export interface WsActionMessage {
     contract: string
     action: string
     receiver: string
+    trx_id?: string
     hex_data?: string
     data?: Record<string, unknown>
 }

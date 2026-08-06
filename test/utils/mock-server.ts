@@ -86,6 +86,7 @@ export class MockActionStreamServer {
         receiver?: string
         data?: Record<string, unknown>
         hexData?: string
+        trxId?: string | null
     }): void {
         const msg: Record<string, unknown> = {
             type: 'action',
@@ -101,6 +102,10 @@ export class MockActionStreamServer {
         }
         if (opts.hexData) {
             msg.hex_data = opts.hexData
+        }
+        if (opts.trxId !== null) {
+            msg.trx_id =
+                opts.trxId ?? '5b273364b825dfd58e7ac36e4014a24f1547cb5b1786a586af31c5a83daaa03b'
         }
         this.broadcast(msg)
     }

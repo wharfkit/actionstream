@@ -1,8 +1,9 @@
-import {Name, UInt64} from '@wharfkit/antelope'
+import {Checksum256, Name, UInt64} from '@wharfkit/antelope'
 
 import {
     ActionStreamFilter,
     ActionStreamOptions,
+    ErrorCode,
     StreamAction,
     StreamState,
     WsAckMessage,
@@ -264,9 +265,19 @@ export class ActionStreamClient {
         contract: string
         action: string
         receiver: string
+        trx_id?: string
         hex_data?: string
         data?: Record<string, unknown>
     }): void {
+        if (!msg.trx_id) {
+            if (this.onError) {
+                this.onError(
+                    ErrorCode.DataInconsistent,
+                    `Action ${msg.global_seq} arrived without a trx_id`
+                )
+            }
+            return
+        }
         const action: StreamAction = {
             globalSeq: UInt64.from(msg.global_seq),
             blockNum: msg.block_num,
@@ -274,6 +285,7 @@ export class ActionStreamClient {
             contract: Name.from(msg.contract),
             action: Name.from(msg.action),
             receiver: Name.from(msg.receiver),
+            trxId: Checksum256.from(msg.trx_id),
         }
         if (msg.hex_data) {
             action.hexData = msg.hex_data

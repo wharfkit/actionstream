@@ -1,7 +1,7 @@
 import {assert} from 'chai'
 import {WebSocket as WsWebSocket} from 'ws'
 
-import {ActionStreamClient} from '$lib'
+import {ActionStreamClient, ErrorCode} from '$lib'
 import {MockActionStreamServer} from '../utils/mock-server'
 
 // Polyfill WebSocket for Node.js test runner
@@ -105,6 +105,51 @@ suite('ActionStreamClient', function () {
                 assert.isUndefined(action.data)
                 client.close()
                 done()
+            })
+        })
+
+        test('should receive action with trx_id', function (done) {
+            const trxId = '5b273364b825dfd58e7ac36e4014a24f1547cb5b1786a586af31c5a83daaa03b'
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            })
+            client.onConnect = () => {
+                server.sendAction({
+                    globalSeq: 6500,
+                    contract: 'eosio.token',
+                    action: 'transfer',
+                    trxId,
+                })
+            }
+            client.connect()
+            client.next().then((action) => {
+                assert.equal(String(action.globalSeq), '6500')
+                assert.equal(String(action.trxId), trxId)
+                client.close()
+                done()
+            })
+        })
+
+        test('should report DataInconsistent when trx_id is absent', function (done) {
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            })
+            client.onConnect = () => {
+                server.sendAction({
+                    globalSeq: 6600,
+                    contract: 'eosio.token',
+                    action: 'transfer',
+                    trxId: null,
+                })
+            }
+            client.onError = (code) => {
+                assert.equal(code, ErrorCode.DataInconsistent)
+                client.close()
+                done()
+            }
+            client.connect()
+            client.nextWithTimeout(200).then((action) => {
+                assert.isNull(action, 'no action should be delivered without a trx_id')
             })
         })
 
