@@ -4,6 +4,7 @@ export type {
     ActionStreamOptions,
     StreamAction,
     StreamError,
+    StreamOverflow,
     StreamState,
 } from './types'
 export {ErrorCode} from './types'

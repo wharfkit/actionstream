@@ -5,6 +5,14 @@ export interface MockServerOptions {
     heartbeatInterval?: number
 }
 
+export interface SubscribeRecord {
+    contracts?: string[]
+    receivers?: string[]
+    actions?: string[]
+    start_seq?: string
+    decode?: boolean
+}
+
 export class MockActionStreamServer {
     private wss: WebSocketServer | null = null
     private clients: Set<WsWebSocket> = new Set()
@@ -12,9 +20,14 @@ export class MockActionStreamServer {
     private _headSeq = 1000
     private _libSeq = 900
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+    private _lastSubscribe: SubscribeRecord | undefined
 
     get port(): number {
         return this._port
+    }
+
+    get lastSubscribe(): SubscribeRecord | undefined {
+        return this._lastSubscribe
     }
 
     get url(): string {
@@ -23,6 +36,12 @@ export class MockActionStreamServer {
 
     get clientCount(): number {
         return this.clients.size
+    }
+
+    async restart(options?: MockServerOptions): Promise<void> {
+        const port = this._port
+        await this.close()
+        await this.start({...options, port})
     }
 
     start(options?: MockServerOptions & {port?: number}): Promise<void> {
@@ -63,6 +82,14 @@ export class MockActionStreamServer {
             })
             ws.close()
             return
+        }
+
+        this._lastSubscribe = {
+            contracts: msg.contracts,
+            receivers: msg.receivers,
+            actions: msg.actions,
+            start_seq: msg.start_seq,
+            decode: msg.decode,
         }
 
         this.sendTo(ws, {
@@ -108,6 +135,12 @@ export class MockActionStreamServer {
                 opts.trxId ?? '5b273364b825dfd58e7ac36e4014a24f1547cb5b1786a586af31c5a83daaa03b'
         }
         this.broadcast(msg)
+    }
+
+    sendActions(globalSeqs: number[], contract = 'eosio.token', action = 'transfer'): void {
+        for (const globalSeq of globalSeqs) {
+            this.sendAction({globalSeq, contract, action})
+        }
     }
 
     sendCatchupComplete(): void {

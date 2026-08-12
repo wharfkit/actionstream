@@ -319,24 +319,31 @@ suite('ActionStreamClient', function () {
             client.connect()
         })
 
-        test('should track currentSeq through consumed actions', function (done) {
+        test('should advance the resume position past a delivered action', function (done) {
+            this.timeout(15000)
             const client = new ActionStreamClient(server.url, {
                 contracts: ['eosio.token'],
-                }, {
-                startSeq: 0,
+            }, {
+                reconnectDelay: 50,
+                reconnectMaxDelay: 50,
             })
-            client.onConnect = () => {
-                server.sendAction({
-                    globalSeq: 500,
-                    contract: 'eosio.token',
-                    action: 'transfer',
-                })
-            }
-            client.connect()
-            client.next().then(() => {
-                assert.isFalse(client.connected === undefined)
+
+            let heartbeats = 0
+            client.onHeartbeat = () => {
+                heartbeats++
+                if (heartbeats === 1) {
+                    server.sendActions([500])
+                    return
+                }
+                assert.equal(server.lastSubscribe!.start_seq, '501')
                 client.close()
                 done()
+            }
+            client.connect()
+
+            client.next().then((action) => {
+                assert.equal(String(action.globalSeq), '500')
+                server.restart()
             })
         })
     })
@@ -418,10 +425,168 @@ suite('ActionStreamClient', function () {
         })
     })
 
+    suite('start at head', function () {
+        test('should subscribe past head when startSeq is head', function (done) {
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                startSeq: 'head',
+            })
+
+            client.onHeartbeat = () => {
+                assert.equal(server.lastSubscribe!.start_seq, '18446744073709551615')
+                client.close()
+                done()
+            }
+            client.connect()
+        })
+
+        test('should resume from the first delivered action, not the sentinel', function (done) {
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                startSeq: 'head',
+            })
+
+            client.onHeartbeat = () => {
+                server.sendAction({
+                    globalSeq: 500,
+                    contract: 'eosio.token',
+                    action: 'transfer',
+                })
+            }
+            client.connect()
+
+            client.next().then((action) => {
+                assert.equal(String(action.globalSeq), '500')
+                client.close()
+                done()
+            })
+        })
+    })
+
+    suite('overflow', function () {
+        test('should resume from the last accepted seq instead of dropping', function (done) {
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                queueSize: 2,
+                reconnectDelay: 50,
+                reconnectMaxDelay: 50,
+            })
+
+            let overflow: {droppedFrom: string; resumeSeq: string; queueSize: number} | undefined
+            client.onOverflow = (info) => {
+                overflow = {
+                    droppedFrom: String(info.droppedFrom),
+                    resumeSeq: String(info.resumeSeq),
+                    queueSize: info.queueSize,
+                }
+                assert.equal(info.overflowCount, 1)
+            }
+
+            let heartbeats = 0
+            client.onHeartbeat = () => {
+                heartbeats++
+                if (heartbeats === 1) {
+                    server.sendActions([10, 20, 30])
+                    return
+                }
+                assert.exists(overflow)
+                assert.equal(overflow!.droppedFrom, '30')
+                assert.equal(overflow!.resumeSeq, '21')
+                assert.equal(overflow!.queueSize, 2)
+                assert.equal(client.overflowCount, 1)
+                assert.equal(server.lastSubscribe!.start_seq, '21')
+
+                client
+                    .next()
+                    .then((first) => {
+                        assert.equal(String(first.globalSeq), '10')
+                        return client.next()
+                    })
+                    .then((second) => {
+                        assert.equal(String(second.globalSeq), '20')
+                        client.close()
+                        done()
+                    })
+            }
+            client.connect()
+        })
+
+        test('should back off while recovery makes no progress', function (done) {
+            this.timeout(15000)
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                queueSize: 1,
+                reconnectDelay: 50,
+                reconnectMaxDelay: 1000,
+            })
+
+            const started = Date.now()
+            let nextSeq = 10
+            client.onHeartbeat = () => {
+                server.sendActions([nextSeq, nextSeq + 1])
+                nextSeq += 10
+                if (client.overflowCount === 4) {
+                    // Resetting the backoff on each redial would land near 150ms.
+                    const elapsed = Date.now() - started
+                    client.close()
+                    done(
+                        elapsed >= 300
+                            ? undefined
+                            : new Error(`four overflows took ${elapsed}ms, backoff did not grow`)
+                    )
+                }
+            }
+            client.connect()
+        })
+    })
+
     suite('reconnect', function () {
+        test('should not re-request queued actions after a reconnect', function (done) {
+            this.timeout(15000)
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                reconnectDelay: 100,
+                reconnectMaxDelay: 500,
+            })
+
+            let heartbeats = 0
+            client.onHeartbeat = () => {
+                heartbeats++
+                if (heartbeats === 1) {
+                    server.sendActions([10, 20])
+                    setTimeout(() => {
+                        server.restart()
+                    }, 50)
+                    return
+                }
+                assert.equal(server.lastSubscribe!.start_seq, '21')
+                server.sendActions([30])
+                client
+                    .next()
+                    .then((first) => {
+                        assert.equal(String(first.globalSeq), '10')
+                        return client.next()
+                    })
+                    .then((second) => {
+                        assert.equal(String(second.globalSeq), '20')
+                        return client.next()
+                    })
+                    .then((third) => {
+                        assert.equal(String(third.globalSeq), '30')
+                        client.close()
+                        done()
+                    })
+            }
+            client.connect()
+        })
+
         test('should reconnect after server closes connection', function (done) {
             this.timeout(15000)
-            const port = server.port
             const client = new ActionStreamClient(server.url, {
                 contracts: ['eosio.token'],
             }, {
@@ -433,10 +598,7 @@ suite('ActionStreamClient', function () {
             client.onConnect = () => {
                 connectCount++
                 if (connectCount === 1) {
-                    server.close().then(() => {
-                        server = new MockActionStreamServer()
-                        return server.start({port})
-                    })
+                    server.restart()
                 } else if (connectCount === 2) {
                     client.close()
                     done()

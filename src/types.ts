@@ -7,11 +7,19 @@ export interface ActionStreamFilter {
 }
 
 export interface ActionStreamOptions {
-    startSeq?: UInt64Type
+    startSeq?: UInt64Type | 'head'
     decode?: boolean
     reconnectDelay?: number
     reconnectMaxDelay?: number
     ackInterval?: number
+    queueSize?: number
+}
+
+export interface StreamOverflow {
+    droppedFrom: UInt64
+    resumeSeq: UInt64
+    queueSize: number
+    overflowCount: number
 }
 
 export interface StreamAction {
