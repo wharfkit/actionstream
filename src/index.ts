@@ -4,6 +4,7 @@ export type {
     ActionStreamOptions,
     StreamAction,
     StreamError,
+    StreamGap,
     StreamOverflow,
     StreamState,
 } from './types'

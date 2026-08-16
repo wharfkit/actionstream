@@ -7,6 +7,47 @@ import {MockActionStreamServer} from '../utils/mock-server'
 // Polyfill WebSocket for Node.js test runner
 ;(global as any).WebSocket = WsWebSocket
 
+function assertGrowing(delays: number[], done: (err?: Error) => void) {
+    for (let i = 1; i < delays.length; i++) {
+        if (delays[i] <= delays[i - 1] + 30) {
+            done(new Error(`backoff did not grow: ${delays.join(', ')}`))
+            return
+        }
+    }
+    done()
+}
+
+// measureReconnectDelays runs provoke() each cycle, records disconnect-to-reconnect delays, and hands three of them to check.
+function measureReconnectDelays(
+    client: ActionStreamClient,
+    provoke: () => void,
+    check: (delays: number[]) => void,
+    via: 'connect' | 'heartbeat' = 'connect'
+) {
+    const delays: number[] = []
+    let disconnectedAt = 0
+    client.onDisconnect = () => {
+        disconnectedAt = Date.now()
+    }
+    const drive = () => {
+        if (disconnectedAt > 0) {
+            delays.push(Date.now() - disconnectedAt)
+        }
+        if (delays.length === 3) {
+            client.close()
+            check(delays)
+            return
+        }
+        provoke()
+    }
+    if (via === 'heartbeat') {
+        client.onHeartbeat = drive
+    } else {
+        client.onConnect = drive
+    }
+    client.connect()
+}
+
 suite('ActionStreamClient', function () {
     this.slow(2000)
     this.timeout(10000)
@@ -520,27 +561,155 @@ suite('ActionStreamClient', function () {
                 contracts: ['eosio.token'],
             }, {
                 queueSize: 1,
-                reconnectDelay: 50,
-                reconnectMaxDelay: 1000,
+                reconnectDelay: 60,
+                reconnectMaxDelay: 2000,
             })
 
-            const started = Date.now()
             let nextSeq = 10
-            client.onHeartbeat = () => {
-                server.sendActions([nextSeq, nextSeq + 1])
-                nextSeq += 10
-                if (client.overflowCount === 4) {
-                    // Resetting the backoff on each redial would land near 150ms.
-                    const elapsed = Date.now() - started
-                    client.close()
-                    done(
-                        elapsed >= 300
-                            ? undefined
-                            : new Error(`four overflows took ${elapsed}ms, backoff did not grow`)
+            measureReconnectDelays(
+                client,
+                () => {
+                    server.sendActions([nextSeq, nextSeq + 1])
+                    nextSeq += 10
+                },
+                (delays) => assertGrowing(delays, done),
+                'heartbeat'
+            )
+        })
+    })
+
+    suite('reconnect backoff', function () {
+        test('should grow backoff across repeated resync disconnects', function (done) {
+            this.timeout(15000)
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                reconnectDelay: 60,
+                reconnectMaxDelay: 2000,
+            })
+
+            client.onError = () => {
+                // code 6 is expected on every cycle
+            }
+            measureReconnectDelays(
+                client,
+                () => {
+                    server.sendCatchupComplete()
+                    server.sendError(ErrorCode.ResyncRequired, 'resync required')
+                    server.disconnectClients()
+                },
+                (delays) => assertGrowing(delays, done)
+            )
+        })
+
+        test('should reset backoff after a connection stays live past the threshold', function (done) {
+            this.timeout(15000)
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                reconnectDelay: 60,
+                reconnectMaxDelay: 2000,
+                healthyThreshold: 150,
+            })
+
+            client.onError = () => {
+                // code 6 is expected on every cycle
+            }
+            let connects = 0
+            measureReconnectDelays(
+                client,
+                () => {
+                    connects++
+                    server.sendCatchupComplete()
+                    if (connects < 3) {
+                        server.sendError(ErrorCode.ResyncRequired, 'resync required')
+                        server.disconnectClients()
+                        return
+                    }
+                    setTimeout(() => server.disconnectClients(), 220)
+                },
+                (delays) => {
+                    assert.isAbove(
+                        delays[1],
+                        delays[0] + 30,
+                        `backoff did not grow while unhealthy: ${delays.join(', ')}`
                     )
+                    assert.isBelow(
+                        delays[2],
+                        delays[1] - 30,
+                        `backoff did not reset after a healthy connection: ${delays.join(', ')}`
+                    )
+                    done()
                 }
+            )
+        })
+
+        test('should not reset backoff on a gap-triggered resubscribe', function (done) {
+            this.timeout(15000)
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                reconnectDelay: 60,
+                reconnectMaxDelay: 2000,
+            })
+
+            let nextSeq = 100
+            measureReconnectDelays(
+                client,
+                () => {
+                    server.sendAction({
+                        globalSeq: nextSeq,
+                        contract: 'eosio.token',
+                        action: 'transfer',
+                        subSeq: 1,
+                    })
+                    server.sendAction({
+                        globalSeq: nextSeq + 1,
+                        contract: 'eosio.token',
+                        action: 'transfer',
+                        subSeq: 5,
+                    })
+                    nextSeq += 10
+                },
+                (delays) => assertGrowing(delays, done)
+            )
+        })
+    })
+
+    suite('stale actions', function () {
+        test('should not rewind the resume cursor or the ack watermark', function (done) {
+            this.timeout(15000)
+            const client = new ActionStreamClient(server.url, {
+                contracts: ['eosio.token'],
+            }, {
+                reconnectDelay: 50,
+                reconnectMaxDelay: 50,
+                ackInterval: 1000,
+            })
+
+            let heartbeats = 0
+            client.onHeartbeat = () => {
+                heartbeats++
+                if (heartbeats === 1) {
+                    server.sendActions([9000, 12000, 100])
+                    return
+                }
+                const resumed = server.lastSubscribe!.start_seq
+                const acks = server.acks.slice()
+                client.close()
+                assert.equal(resumed, '12001')
+                assert.deepEqual(acks, ['9000', '12000'])
+                done()
             }
             client.connect()
+            ;(async () => {
+                const seen: string[] = []
+                for (let i = 0; i < 3; i++) {
+                    seen.push(String((await client.next()).globalSeq))
+                }
+                assert.deepEqual(seen, ['9000', '12000', '100'])
+                server.restart()
+            })()
         })
     })
 
@@ -605,6 +774,115 @@ suite('ActionStreamClient', function () {
                 }
             }
             client.connect()
+        })
+    })
+
+    suite('sub_seq gap detection', function () {
+        test('should fire onGap and resubscribe from last accepted on a gap', function (done) {
+            const client = new ActionStreamClient(
+                server.url,
+                {contracts: ['eosio.token']},
+                {reconnectDelay: 10}
+            )
+            const seen: string[] = []
+            ;(async () => {
+                for await (const action of client) {
+                    seen.push(String(action.globalSeq))
+                }
+            })()
+            let first = true
+            client.onConnect = () => {
+                if (!first) return
+                first = false
+                server.sendAction({globalSeq: 5000, contract: 'eosio.token', action: 'transfer', subSeq: 1})
+                server.sendAction({globalSeq: 5001, contract: 'eosio.token', action: 'transfer', subSeq: 2})
+                server.sendAction({globalSeq: 5010, contract: 'eosio.token', action: 'transfer', subSeq: 5})
+            }
+            client.onGap = (gap) => {
+                assert.equal(gap.expected, 3)
+                assert.equal(gap.received, 5)
+                assert.equal(String(gap.resumeSeq), '5002')
+                setTimeout(() => {
+                    assert.equal(server.lastSubscribe?.start_seq, '5002')
+                    assert.deepEqual(seen, ['5000', '5001'])
+                    client.close()
+                    done()
+                }, 100)
+            }
+            client.connect()
+        })
+
+        test('should not fire onGap for contiguous sub_seq', function (done) {
+            const client = new ActionStreamClient(server.url, {contracts: ['eosio.token']})
+            client.onGap = () => done(new Error('unexpected onGap'))
+            const seen: string[] = []
+            ;(async () => {
+                for await (const action of client) {
+                    seen.push(String(action.globalSeq))
+                    if (seen.length === 3) {
+                        assert.deepEqual(seen, ['100', '101', '102'])
+                        client.close()
+                        done()
+                    }
+                }
+            })()
+            client.onConnect = () => {
+                server.sendAction({globalSeq: 100, contract: 'eosio.token', action: 'transfer', subSeq: 1})
+                server.sendAction({globalSeq: 101, contract: 'eosio.token', action: 'transfer', subSeq: 2})
+                server.sendAction({globalSeq: 102, contract: 'eosio.token', action: 'transfer', subSeq: 3})
+            }
+            client.connect()
+        })
+
+        test('should disable checking when server omits sub_seq', function (done) {
+            const client = new ActionStreamClient(server.url, {contracts: ['eosio.token']})
+            client.onGap = () => done(new Error('unexpected onGap'))
+            client.onConnect = () => {
+                server.sendAction({globalSeq: 100, contract: 'eosio.token', action: 'transfer'})
+                server.sendAction({globalSeq: 200, contract: 'eosio.token', action: 'transfer'})
+            }
+            client.connect()
+            ;(async () => {
+                const a = await client.next()
+                const b = await client.next()
+                assert.equal(String(a.globalSeq), '100')
+                assert.equal(String(b.globalSeq), '200')
+                client.close()
+                done()
+            })()
+        })
+
+        test('should accept sub_seq restarting at 1 after reconnect', function (done) {
+            const client = new ActionStreamClient(
+                server.url,
+                {contracts: ['eosio.token']},
+                {reconnectDelay: 10}
+            )
+            let gaps = 0
+            client.onGap = () => {
+                gaps++
+                if (gaps > 1) done(new Error('gap fired on post-reconnect sub_seq reset'))
+            }
+            let connects = 0
+            client.onConnect = () => {
+                connects++
+                if (connects === 1) {
+                    server.sendAction({globalSeq: 100, contract: 'eosio.token', action: 'transfer', subSeq: 1})
+                    server.sendAction({globalSeq: 300, contract: 'eosio.token', action: 'transfer', subSeq: 3})
+                } else {
+                    server.sendAction({globalSeq: 101, contract: 'eosio.token', action: 'transfer', subSeq: 1})
+                }
+            }
+            client.connect()
+            ;(async () => {
+                const a = await client.next()
+                const b = await client.next()
+                assert.equal(String(a.globalSeq), '100')
+                assert.equal(String(b.globalSeq), '101')
+                assert.equal(gaps, 1)
+                client.close()
+                done()
+            })()
         })
     })
 })

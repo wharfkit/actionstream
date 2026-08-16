@@ -13,6 +13,7 @@ export interface ActionStreamOptions {
     reconnectMaxDelay?: number
     ackInterval?: number
     queueSize?: number
+    healthyThreshold?: number
 }
 
 export interface StreamOverflow {
@@ -20,6 +21,12 @@ export interface StreamOverflow {
     resumeSeq: UInt64
     queueSize: number
     overflowCount: number
+}
+
+export interface StreamGap {
+    expected: number
+    received: number
+    resumeSeq: UInt64
 }
 
 export interface StreamAction {
@@ -45,6 +52,7 @@ export enum ErrorCode {
     MaxClients = 3,
     NoActions = 4,
     DataInconsistent = 5,
+    ResyncRequired = 6,
 }
 
 export interface StreamError {
@@ -72,6 +80,7 @@ export interface WsActionMessage {
     trx_id?: string
     hex_data?: string
     data?: Record<string, unknown>
+    sub_seq?: number
 }
 
 export interface WsHeartbeatMessage {

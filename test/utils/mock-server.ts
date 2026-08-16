@@ -21,6 +21,7 @@ export class MockActionStreamServer {
     private _libSeq = 900
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null
     private _lastSubscribe: SubscribeRecord | undefined
+    private _acks: string[] = []
 
     get port(): number {
         return this._port
@@ -28,6 +29,10 @@ export class MockActionStreamServer {
 
     get lastSubscribe(): SubscribeRecord | undefined {
         return this._lastSubscribe
+    }
+
+    get acks(): string[] {
+        return this._acks
     }
 
     get url(): string {
@@ -99,8 +104,10 @@ export class MockActionStreamServer {
         })
 
         ws.on('message', (ackData) => {
-            // handle ack messages silently
-            JSON.parse(ackData.toString())
+            const ack = JSON.parse(ackData.toString())
+            if (ack.type === 'ack') {
+                this._acks.push(String(ack.seq))
+            }
         })
     }
 
@@ -114,6 +121,7 @@ export class MockActionStreamServer {
         data?: Record<string, unknown>
         hexData?: string
         trxId?: string | null
+        subSeq?: number
     }): void {
         const msg: Record<string, unknown> = {
             type: 'action',
@@ -123,6 +131,9 @@ export class MockActionStreamServer {
             contract: opts.contract,
             action: opts.action,
             receiver: opts.receiver || opts.contract,
+        }
+        if (opts.subSeq !== undefined) {
+            msg.sub_seq = opts.subSeq
         }
         if (opts.data) {
             msg.data = opts.data
@@ -161,6 +172,12 @@ export class MockActionStreamServer {
             head_seq: String(this._headSeq),
             lib_seq: String(this._libSeq),
         })
+    }
+
+    disconnectClients(): void {
+        for (const ws of this.clients) {
+            ws.close()
+        }
     }
 
     setHead(headSeq: number, libSeq: number): void {

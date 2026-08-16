@@ -5,9 +5,11 @@ import {
     ActionStreamOptions,
     ErrorCode,
     StreamAction,
+    StreamGap,
     StreamOverflow,
     StreamState,
     WsAckMessage,
+    WsActionMessage,
     WsServerMessage,
     WsSubscribeMessage,
 } from './types'
@@ -16,6 +18,7 @@ const DEFAULT_RECONNECT_DELAY = 1000
 const DEFAULT_RECONNECT_MAX_DELAY = 30000
 const DEFAULT_ACK_INTERVAL = 1000
 const DEFAULT_QUEUE_SIZE = 1000
+const DEFAULT_HEALTHY_THRESHOLD = 10000
 
 const START_AT_HEAD_SENTINEL = UInt64.from(UInt64.max)
 
@@ -27,6 +30,7 @@ export class ActionStreamClient {
     private reconnectMaxDelay: number
     private ackInterval: number
     private queueSize: number
+    private healthyThreshold: number
     private startAtHead: boolean
 
     private ws: WebSocket | null = null
@@ -43,8 +47,11 @@ export class ActionStreamClient {
     private waitingReject: ((err: Error) => void) | null = null
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null
     private currentBackoff: number
-    private recoveringFromOverflow = false
+    private readonly ackIntervalU64: UInt64
+    private hasAcked = false
+    private catchupCompleteAt: number | null = null
     private _overflowCount = 0
+    private expectedSubSeq: number | null = 1
 
     onHeartbeat?: (state: StreamState) => void
     onCatchupComplete?: (state: StreamState) => void
@@ -52,6 +59,7 @@ export class ActionStreamClient {
     onConnect?: () => void
     onDisconnect?: () => void
     onOverflow?: (overflow: StreamOverflow) => void
+    onGap?: (gap: StreamGap) => void
 
     constructor(url: string, filter: ActionStreamFilter, options?: ActionStreamOptions) {
         this.url = url
@@ -71,12 +79,17 @@ export class ActionStreamClient {
                 : DEFAULT_ACK_INTERVAL
         this.queueSize =
             options && options.queueSize !== undefined ? options.queueSize : DEFAULT_QUEUE_SIZE
+        this.healthyThreshold =
+            options && options.healthyThreshold !== undefined
+                ? options.healthyThreshold
+                : DEFAULT_HEALTHY_THRESHOLD
         this.startAtHead = options !== undefined && options.startSeq === 'head'
         this.currentSeq =
             options && options.startSeq !== undefined && !this.startAtHead
                 ? UInt64.from(options.startSeq)
                 : UInt64.from(0)
         this.currentBackoff = this.reconnectDelay
+        this.ackIntervalU64 = UInt64.from(this.ackInterval)
     }
 
     get headSeq(): UInt64 {
@@ -177,8 +190,6 @@ export class ActionStreamClient {
         }
         const action = this.queue.shift()!
         this.ackSeq(action)
-        // Consumer progress: a later reconnect may reset its backoff again.
-        this.recoveringFromOverflow = false
         return action
     }
 
@@ -193,9 +204,16 @@ export class ActionStreamClient {
         }
     }
 
+    // resetConnectionState clears every field whose lifetime is one socket.
+    private resetConnectionState(): void {
+        this.catchupCompleteAt = null
+        this.expectedSubSeq = 1
+    }
+
     private dial(): void {
         const ws = new WebSocket(this.url)
         this.ws = ws
+        this.resetConnectionState()
 
         ws.onopen = () => {
             this.sendSubscribe()
@@ -216,6 +234,9 @@ export class ActionStreamClient {
                 this.onDisconnect()
             }
             if (!this.closed) {
+                if (this.wasHealthy()) {
+                    this.currentBackoff = this.reconnectDelay
+                }
                 this.scheduleReconnect()
             }
         }
@@ -250,9 +271,6 @@ export class ActionStreamClient {
 
         this.ws.send(JSON.stringify(msg))
         this._connected = true
-        if (!this.recoveringFromOverflow) {
-            this.currentBackoff = this.reconnectDelay
-        }
         if (this.onConnect) {
             this.onConnect()
         }
@@ -286,17 +304,16 @@ export class ActionStreamClient {
         }
     }
 
-    private handleAction(msg: {
-        global_seq: string
-        block_num: number
-        block_time: number
-        contract: string
-        action: string
-        receiver: string
-        trx_id?: string
-        hex_data?: string
-        data?: Record<string, unknown>
-    }): void {
+    private handleAction(msg: WsActionMessage): void {
+        if (msg.sub_seq === undefined) {
+            this.expectedSubSeq = null
+        } else if (this.expectedSubSeq !== null) {
+            if (msg.sub_seq !== this.expectedSubSeq) {
+                this.handleGap(msg.sub_seq)
+                return
+            }
+            this.expectedSubSeq = msg.sub_seq + 1
+        }
         if (!msg.trx_id) {
             if (this.onError) {
                 this.onError(
@@ -339,7 +356,6 @@ export class ActionStreamClient {
 
     private handleOverflow(action: StreamAction): void {
         this._overflowCount++
-        this.recoveringFromOverflow = true
         if (this.onOverflow) {
             this.onOverflow({
                 droppedFrom: action.globalSeq,
@@ -347,6 +363,14 @@ export class ActionStreamClient {
                 queueSize: this.queue.length,
                 overflowCount: this._overflowCount,
             })
+        }
+        this.resubscribe()
+    }
+
+    private handleGap(received: number): void {
+        const expected = this.expectedSubSeq!
+        if (this.onGap) {
+            this.onGap({expected, received, resumeSeq: this.currentSeq})
         }
         this.resubscribe()
     }
@@ -374,6 +398,7 @@ export class ActionStreamClient {
         this._headSeq = UInt64.from(msg.head_seq)
         this._libSeq = UInt64.from(msg.lib_seq)
         this._catchupComplete = true
+        this.catchupCompleteAt = Date.now()
         if (this.onCatchupComplete) {
             this.onCatchupComplete({headSeq: this._headSeq, libSeq: this._libSeq})
         }
@@ -386,16 +411,24 @@ export class ActionStreamClient {
     }
 
     private acceptSeq(action: StreamAction): void {
+        if (action.globalSeq.lt(this.currentSeq)) {
+            return
+        }
         this.currentSeq = action.globalSeq.adding(1).cast(UInt64)
     }
 
     private ackSeq(action: StreamAction): void {
-        if (this.ackInterval > 0) {
-            const diff = action.globalSeq.subtracting(this.lastAcked)
-            if (diff.gte(UInt64.from(this.ackInterval))) {
-                this.lastAcked = action.globalSeq
-                this.sendAck(action.globalSeq)
-            }
+        if (this.ackInterval <= 0) {
+            return
+        }
+        if (this.hasAcked && action.globalSeq.lte(this.lastAcked)) {
+            return
+        }
+        const diff = action.globalSeq.subtracting(this.lastAcked)
+        if (diff.gte(this.ackIntervalU64)) {
+            this.lastAcked = action.globalSeq
+            this.hasAcked = true
+            this.sendAck(action.globalSeq)
         }
     }
 
@@ -408,6 +441,13 @@ export class ActionStreamClient {
             seq: seq.toString(),
         }
         this.ws.send(JSON.stringify(msg))
+    }
+
+    private wasHealthy(): boolean {
+        if (this.catchupCompleteAt === null) {
+            return false
+        }
+        return Date.now() - this.catchupCompleteAt >= this.healthyThreshold
     }
 
     private scheduleReconnect(): void {

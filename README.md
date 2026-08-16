@@ -53,18 +53,29 @@ const client = new ActionStreamClient(url, filter, {
     reconnectMaxDelay: 30000,   // max reconnect delay in ms (default: 30000)
     ackInterval: 1000,          // sequence span between ack messages (default: 1000)
     queueSize: 1000,            // buffered actions before overflow recovery (default: 1000)
+    healthyThreshold: 10000,    // ms live before a connection counts as healthy (default: 10000)
 })
 ```
 
-Omitting `startSeq` replays all retained history from the start of the stream. Pass `'head'` to
-receive only the actions that arrive after connecting.
+Omitting `startSeq` replays all retained history from the start of the stream. Pass `'head'` to receive only the actions that arrive after connecting.
+
+### Delivery Guarantee
+
+Paired with an actionindex server that emits `sub_seq`, the stream delivers every action matching the filter with `global_seq >= start_seq` at least once and in order. Duplicates are possible across reconnects; consumers that need exactly-once effects deduplicate by `globalSeq`. A server-side delivery fault surfaces as an automatic reconnect that resumes from the last accepted action, so faults degrade to latency rather than data loss. The guarantee assumes the server retains full history, which actionindex does.
+
+The server assigns each connection a `sub_seq` counter. A skip in that counter signals a protocol-level delivery fault; the client resumes automatically from the last accepted sequence and fires `onGap`.
+
+```typescript
+client.onGap = (gap) => {
+    console.log('gap: expected', gap.expected, 'received', gap.received, 'resuming from', String(gap.resumeSeq))
+}
+```
+
+Servers that predate `sub_seq` do not send it, and the client disables the check for that connection.
 
 ### Overflow
 
-A consumer that drains slower than actions arrive fills the client's buffer. On a full buffer the
-client keeps everything it has already accepted, reconnects, and resumes from the sequence after
-the last accepted action, so no action is skipped. Every occurrence fires `onOverflow` and
-increments `overflowCount`.
+A consumer that drains slower than actions arrive fills the client's buffer. On a full buffer the client keeps everything it has already accepted, reconnects, and resumes from the sequence after the last accepted action, so no action is skipped. Every occurrence fires `onOverflow` and increments `overflowCount`.
 
 ```typescript
 client.onOverflow = (info) => {
@@ -72,10 +83,11 @@ client.onOverflow = (info) => {
 }
 ```
 
-Acks are sent as actions are consumed, and the server's own flow control watches them: once its
-unacked window (10,000 actions) closes, it drops rather than blocks. Keep `queueSize` well below
-that window. Raising it past the window moves the loss server-side, where the client cannot
-observe it.
+Acks are sent as actions are consumed, and the server's own flow control watches them: once its unacked window (10,000 actions) closes, it drops rather than blocks. Keep `queueSize` well below that window. Raising it past the window moves the loss server-side, where the client cannot observe it.
+
+### Reconnect Backoff
+
+Every dropped connection schedules a redial after the current backoff delay, which starts at `reconnectDelay` and doubles up to `reconnectMaxDelay`. The delay returns to `reconnectDelay` once a connection proves healthy, meaning it reached `catchup_complete` and then stayed live for `healthyThreshold` milliseconds. Connections that die sooner leave the backoff growing, so a server that repeatedly disconnects a client right after catch-up (error code 6, for example) sees the redial interval widen instead of a flat retry loop. Overflow and gap recovery reconnect under the same rule.
 
 ### Lifecycle Callbacks
 
@@ -88,7 +100,21 @@ client.onHeartbeat = (state) => {
 client.onCatchupComplete = (state) => {}
 client.onError = (code, message) => {}
 client.onOverflow = (overflow) => {}
+client.onGap = (gap) => {}
 ```
+
+`onError` receives the server's error code and message. The `ErrorCode` enum names each code.
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 1 | `InvalidRequest` | The subscribe message was malformed or the filter was rejected |
+| 2 | `ServerSyncing` | The server is still catching up to the chain |
+| 3 | `MaxClients` | The server is at its connection limit |
+| 4 | `NoActions` | The filter matches no retained actions |
+| 5 | `DataInconsistent` | An action arrived without the fields the protocol requires |
+| 6 | `ResyncRequired` | The subscription lagged too far behind and the server closed it |
+
+Code 6 arrives with a disconnect. The client reconnects on its own and resumes from the last accepted sequence.
 
 ### State
 
